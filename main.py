@@ -1,8 +1,8 @@
-# main.py
 import re
 import math
 import random
 import asyncio
+import json
 from typing import List, Dict
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -47,6 +47,64 @@ class MessageSplitterPlugin(Star):
             self.split_ratio_max = 0.9
 
         self.secondary_pattern = re.compile(r"[，,、；;]+")
+
+    def _normalize_split_chars(self, value) -> List[str]:
+        """兼容旧版 list 配置与新版 text/string 配置。"""
+        default_items = ["。", "？", "！", "?", "!", "；", ";", "\n"]
+
+        if isinstance(value, list):
+            normalized = []
+            for item in value:
+                if item is None:
+                    continue
+                item = str(item)
+                if not item:
+                    continue
+                normalized.append("\n" if item == r"\n" else item)
+            return normalized or ["\n"]
+
+        if not isinstance(value, str):
+            return default_items
+
+        raw = value.strip()
+        if not raw:
+            return default_items
+
+        # 兼容用户直接填 JSON 数组字符串
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return self._normalize_split_chars(parsed)
+            except Exception:
+                pass
+
+        # 多行输入优先：每行一个分隔符/文本
+        if "\n" in value or "\r" in value:
+            items = []
+            for line in value.splitlines():
+                item = line.strip()
+                if not item:
+                    continue
+                items.append("\n" if item == r"\n" else item)
+            if items:
+                return items
+
+        # 兼容以 | 分隔多个分段符
+        if "|" in raw:
+            items = []
+            for part in raw.split("|"):
+                item = part.strip()
+                if not item:
+                    continue
+                items.append("\n" if item == r"\n" else item)
+            if items:
+                return items
+
+        # 兜底：把普通字符串按单字符拆分；若本身是 \n 则转实际换行
+        if raw == r"\n":
+            return ["\n"]
+        return list(raw)
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -173,16 +231,14 @@ class MessageSplitterPlugin(Star):
         # 6. 获取分段配置
         if split_mode == "simple":
             split_chars_cfg = self.config.get("split_chars", ["。", "？", "！", "?", "!", "；", ";", "\n"])
-            if isinstance(split_chars_cfg, str):
-                split_pattern = f"[{re.escape(split_chars_cfg)}]+"
+            split_chars_items = self._normalize_split_chars(split_chars_cfg)
+            escaped_items = [re.escape(str(c)) for c in split_chars_items if c]
+            escaped_items.sort(key=len, reverse=True)
+            if escaped_items:
+                joined = "|".join(escaped_items)
+                split_pattern = f"(?:{joined})+"
             else:
-                escaped_items = [re.escape(str(c)) for c in split_chars_cfg if c]
-                escaped_items.sort(key=len, reverse=True)
-                if escaped_items:
-                    joined = "|".join(escaped_items)
-                    split_pattern = f"(?:{joined})+"
-                else:
-                    split_pattern = r"[\n]+" # 兜底
+                split_pattern = r"[\n]+" # 兜底
         else:
             # 正则模式：使用自定义正则切分
             split_pattern = self.config.get("split_regex", r"[。？！?!\\n…]+")
